@@ -1,0 +1,20 @@
+{
+  "name": "claude-in-firefox",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MCP server that lets Claude Code drive your own Firefox over WebDriver BiDi",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs && bash -n bin/firefox-remote"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@10.28.2",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "puppeteer-core": "^25.17.0",
+    "zod": "^4.6.7"
+  }
+}

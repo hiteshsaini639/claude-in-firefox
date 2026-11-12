@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# Starts Firefox with remote control on, for the claude-in-firefox MCP server.
+#
+#   firefox-remote                   your everyday profile; Firefox must be closed
+#   firefox-remote --claude-profile  Claude's own profile, beside your everyday Firefox
+#
+# Other arguments go to Firefox (e.g. --headless). FIREFOX_PROFILE names another
+# profile folder; FIREFOX_REMOTE_PORT the port.
+set -euo pipefail
+
+port="${FIREFOX_REMOTE_PORT:-9222}"
+claude_profile=0
+if [[ "${1:-}" == --claude-profile ]]; then
+  claude_profile=1
+  shift
+fi
+
+listening() { (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; }
+
+find_profile() {
+  if [[ -n "${FIREFOX_PROFILE:-}" ]]; then
+    echo "$FIREFOX_PROFILE"
+    return
+  fi
+  local roots=() root rel
+  [[ -x /snap/bin/firefox ]] && roots+=("$HOME/snap/firefox/common/.mozilla/firefox")
+  roots+=("$HOME/.config/mozilla/firefox" "$HOME/.mozilla/firefox")
+  for root in "${roots[@]}"; do
+    [[ -f "$root/profiles.ini" ]] || continue
+    # The install's default wins, as it does for Firefox; else the profile marked Default=1.
+    rel=$(awk -F= '/^Default=/ { print $2; exit }' "$root/installs.ini" 2>/dev/null || true)
+    [[ -z "$rel" ]] && rel=$(awk -F= '/^\[/ { inst = /^\[Install/ } inst && /^Default=/ { print $2; exit }' "$root/profiles.ini")
+    [[ -z "$rel" ]] && rel=$(awk -F= '
+      /^\[/ { p = ""; d = 0; prof = /^\[Profile/ }
+      prof && /^Path=/ { p = $2 }
+      prof && /^Default=1/ { d = 1 }
+      prof && d && p != "" { print p; exit }' "$root/profiles.ini")
+    if [[ -n "$rel" ]]; then
+      [[ "$rel" == /* ]] && echo "$rel" || echo "$root/$rel"
+      return
+    fi
+  done
+  return 1
+}
+
+if ((claude_profile)); then
+  if [[ -n "${FIREFOX_PROFILE:-}" ]]; then
+    echo "Use --claude-profile or FIREFOX_PROFILE, not both." >&2
+    exit 1
+  fi
+  # The snap can only reach its own folder under ~/snap.
+  if [[ -x /snap/bin/firefox ]]; then
+    profile="$HOME/snap/firefox/common/claude-profile"
+  else
+    profile="${XDG_DATA_HOME:-$HOME/.local/share}/claude-in-firefox/profile"
+  fi
+  new=0
+  [[ -d "$profile" ]] || new=1
+  mkdir -p "$profile"
+  # user.js is read at every start. The dialog setting costs nothing here, as
+  # nobody browses in this profile but Claude.
+  for pref in 'user_pref("remote.prefs.recommended", false);' 'user_pref("dom.successive_dialog_time_limit", 0);'; do
+    grep -qsF "$pref" "$profile/user.js" || echo "$pref" >>"$profile/user.js"
+  done
+  # Without it a running everyday Firefox would take the request instead.
+  set -- --new-instance "$@"
+else
+  profile=$(find_profile) || { echo "No Firefox profile found. Set FIREFOX_PROFILE to the profile folder." >&2; exit 1; }
+  [[ -d "$profile" ]] || { echo "The profile folder $profile does not exist." >&2; exit 1; }
+fi
+
+if listening; then
+  owner=$(ss -ltnpH "sport = :$port" 2>/dev/null | grep -o 'users:(("[^"]*"' | cut -d'"' -f2 | head -1 || true)
+  if [[ "$owner" == firefox* ]]; then
+    # Firefox writes this file into the profile that is listening.
+    if [[ -f "$profile/WebDriverBiDiServer.json" ]]; then
+      echo "Firefox already has remote control on, on 127.0.0.1:$port (profile $profile)."
+      exit 0
+    fi
+    echo "Remote control is already on in a different Firefox profile, on port $port. Quit that Firefox first; only one can use the port." >&2
+    exit 1
+  fi
+  if [[ -z "$owner" ]]; then
+    echo "Port $port is in use, by a program that has not said which. A Firefox that is still closing holds it for a few seconds; try again shortly." >&2
+  else
+    echo "Port $port is taken by $owner. Free it, or set FIREFOX_REMOTE_PORT for both this script and the MCP server." >&2
+  fi
+  exit 1
+fi
+
+# Remote control otherwise switches off, for this run, phishing and malware
+# protection, tracking protection, the popup blocker and saved-password filling.
+if ! grep -qsF 'user_pref("remote.prefs.recommended", false);' "$profile/prefs.js" "$profile/user.js"; then
+  cat >&2 <<EOF
+One setting first, once. When Firefox runs under remote control it normally
+switches to test-automation defaults for that run: phishing and malware
+protection, tracking protection, the popup blocker and saved-password filling
+all go off. One setting stops that, and it changes nothing in normal browsing:
+
+  1. In Firefox, open about:config and accept the warning.
+  2. Search for remote.prefs.recommended
+  3. Click its toggle button so it reads false.
+
+Then quit Firefox and run this again. Or run it with --claude-profile, which
+needs neither.
+Profile: $profile
+EOF
+  exit 1
+fi
+
+if [[ -L "$profile/lock" ]]; then
+  pid=$(readlink "$profile/lock")
+  pid="${pid##*+}"
+  if kill -0 "$pid" 2>/dev/null; then
+    if ((claude_profile)); then
+      echo "Claude's Firefox is open without remote control. Quit that window's Firefox (Ctrl+Q in it), then run this again." >&2
+    else
+      cat >&2 <<EOF
+Firefox is open, and remote control can only be switched on as it starts.
+Quit it (Ctrl+Q), then run this again. Your tabs come back if Settings →
+General → "Open previous windows and tabs" is on. Or run this with
+--claude-profile, which starts a separate Firefox beside yours.
+EOF
+    fi
+    exit 1
+  fi
+fi
+
+if ! ((claude_profile)) && ! grep -qsF 'user_pref("dom.successive_dialog_time_limit", 0);' "$profile/prefs.js" "$profile/user.js"; then
+  cat <<EOF
+Optional: Claude cannot see or answer a page's second dialog when it opens
+within 3 seconds of the first (Firefox adds a "stop this page" checkbox to it,
+and remote control does not support that kind). Setting
+dom.successive_dialog_time_limit to 0 in about:config prevents it; Firefox then
+stops offering that checkbox, also in normal browsing.
+
+EOF
+fi
+
+setsid -f firefox --profile "$profile" --remote-debugging-port "$port" "$@" >/dev/null 2>&1 </dev/null
+
+for _ in $(seq 60); do
+  if listening; then
+    echo "Firefox is up with remote control on 127.0.0.1:$port (profile $profile)."
+    if ((claude_profile)); then
+      ((new)) && echo "This is a new, empty profile: sign in there only to the sites you want Claude to use. It keeps those sign-ins between runs."
+      echo "It is a separate Firefox with a striped address bar. Quit it (Ctrl+Q in its window) when Claude is done; your everyday Firefox is not affected."
+    else
+      echo "Its address bar is striped while it is remote-controllable. Quit Firefox and start it normally to turn that off."
+    fi
+    exit 0
+  fi
+  sleep 0.5
+done
+echo "Firefox started, but port $port did not open within 30 seconds." >&2
+exit 1
