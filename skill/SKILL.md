@@ -31,6 +31,12 @@ allows one at a time.
 
 - Open your own tab with `tab_open` unless the user names one of theirs. When
   done, close the tabs you opened unless the user wants to see them.
+- The tools work on a tab whether or not it is in front, and while Firefox's
+  window is behind others; never ask the user to bring it forward for them.
+  `tab_focus` is only for showing the user a tab.
+- A page out of sight is not repainted, so its animations pause. If a page
+  seems stuck on a spinner or a transition, ask the user to look at the
+  Firefox window, then check again.
 - Read, act, check: `read_page` lists links, buttons and fields with refs;
   pass a ref to `click`, `type` or `select_option`; then `read_page`,
   `get_text` or `screenshot` to see what happened.

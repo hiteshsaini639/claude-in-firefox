@@ -81,6 +81,10 @@ Quit Firefox and start it normally to switch it off. It needs, once:
   can listen on the port, too: Claude's profile or your everyday one.
 - A server killed outright (not closed) leaves its session open, and Firefox
   refuses new ones until it restarts. Closing Claude Code normally is fine.
+- Firefox's window can stay behind your other windows while Claude works;
+  the tools work on a tab whether it is in front or not. Firefox does not
+  repaint a window that is out of sight, though, so animations on its pages
+  pause until you look at it.
 - `read_page` does not see inside iframes; Claude uses a screenshot and
   clicks by position there.
 - Console and network output is kept from the moment the server first
@@ -95,3 +99,8 @@ Quit Firefox and start it normally to switch it off. It needs, once:
 `FIREFOX_REMOTE_PORT` changes the port, for the script and the server alike.
 `FIREFOX_PROFILE` points the script at a profile folder other than your
 default.
+
+## Testing
+
+With `bin/firefox-remote --claude-profile` running, `pnpm test` puts every
+tool through the server against a local test page, in tabs of its own.

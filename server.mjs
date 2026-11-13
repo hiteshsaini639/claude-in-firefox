@@ -34,17 +34,29 @@ const friendly = e => {
   if (/Maximum number of active sessions/.test(m)) {
     return 'Firefox already has a remote-control session. Firefox allows one at a time: another Claude session may be using it, or an earlier connection ended without closing. Close the other session; if none is using it, quit Firefox and run bin/firefox-remote again.'
   }
+  const code = m.match(/NS_ERROR_[A-Z_]+/)?.[0]
+  if (code) return `Firefox could not load the page (${code}). ${NET[code] ?? ''}`.trim()
+  // Firefox appends its own stack to some errors.
+  if (/@(chrome|resource):\/\//.test(m)) return m.split('\n')[0].replace(/\s#\S+@\S+/g, '')
   return m
+}
+
+const NET = {
+  NS_ERROR_UNKNOWN_HOST: 'No such site: the host name does not exist.',
+  NS_ERROR_CONNECTION_REFUSED: 'Nothing is listening at that address and port.',
+  NS_ERROR_NET_TIMEOUT: 'The site did not answer in time.',
+  NS_ERROR_OFFLINE: 'Firefox is offline.',
+  NS_ERROR_MALFORMED_URI: 'Give the whole address, with https:// or http://.',
 }
 
 function instrument(page) {
   if (pageState.has(page)) return pageState.get(page)
-  const s = { console: [], network: [], pending: new WeakMap(), acceptDialogs: 0, mine: false }
+  const s = { console: [], network: [], seq: 0, pending: new WeakMap(), acceptDialogs: 0, mine: false }
   pageState.set(page, s)
   page.on('console', m => push(s.console, `${m.type()}: ${m.text()}`))
   page.on('pageerror', e => push(s.console, `pageerror: ${e.message}`))
   page.on('request', r => {
-    const entry = { method: r.method(), url: r.url(), status: 'pending' }
+    const entry = { method: r.method(), url: r.url(), status: 'pending', seq: ++s.seq }
     s.pending.set(r, entry)
     push(s.network, entry)
   })
@@ -152,14 +164,14 @@ async function element(page, { ref, selector }) {
 // Firefox cannot report or answer a dialog that opens within
 // dom.successive_dialog_time_limit seconds of the last one (it carries a
 // "stop this page" checkbox), and the action waits on it for good.
-async function act(run, ms = 15000) {
+async function act(run, ms = 15000, slow = `Firefox did not finish within ${ms / 1000} s.`) {
   let timer
   const stuck = new Promise((_, reject) => {
     timer = setTimeout(
       () =>
         reject(
           new Error(
-            `Firefox did not finish within ${ms / 1000} s. The usual cause is a dialog remote control cannot see: a second one within 3 seconds of the last. Ask the user to answer it in the tab; setting dom.successive_dialog_time_limit to 0 in about:config prevents it.`,
+            `${slow} A cause can be a dialog remote control cannot see: a second one within 3 seconds of the last. Ask the user to answer it in the tab; setting dom.successive_dialog_time_limit to 0 in about:config prevents it.`,
           ),
         ),
       ms,
@@ -172,6 +184,72 @@ async function act(run, ms = 15000) {
   }
 }
 
+// A Firefox window behind another one is not repainted. Firefox then never
+// finishes switching tabs, page.bringToFront() also waits for the desktop to
+// focus the window (GNOME refuses), and requestAnimationFrame and
+// IntersectionObserver stop. So nothing here waits on any of those: a tab
+// behind others still loads, reads, clicks, types and screenshots.
+function front(page) {
+  quick(page, () => document.visibilityState === 'visible', true).then(shown => shown || page.bringToFront().catch(() => {}))
+}
+
+// An evaluate that gives up: a page mid-navigation or behind a dialog may never answer.
+const quick = (page, fn, fallback, ms = 1000) =>
+  Promise.race([page.evaluate(fn).catch(() => fallback), new Promise(r => setTimeout(() => r(fallback), ms))])
+
+// Firefox does the waiting. Puppeteer's goto, reload and goBack wait through
+// its own navigation tracking, which a page restored from the back/forward
+// cache leaves on a navigation that never ends, so the next goto never returns.
+async function load(page, url) {
+  const s = instrument(page)
+  const since = s.seq
+  const context = page.mainFrame().browsingContext
+  await act(
+    () => (url === 'reload' ? context.reload({ wait: 'complete' }) : context.navigate(url, 'complete')),
+    40000,
+    'The page did not finish loading within 40 s; it may still be loading.',
+  )
+  const [href] = await live(page)
+  const doc = s.network.findLast(r => r.seq > since && r.url.split('#')[0] === href.split('#')[0])
+  return typeof doc?.status === 'number' ? `HTTP ${doc.status}. ` : ''
+}
+
+async function traverse(page, delta) {
+  const before = await quick(page, () => ((window.__claudeInFirefoxLeaving = true), location.href), null)
+  try {
+    await page.mainFrame().browsingContext.traverseHistory(delta)
+  } catch (e) {
+    if (/no such history entry/i.test(e.message)) throw new Error(`This tab has no ${delta < 0 ? 'earlier' : 'later'} page in its history.`)
+    throw e
+  }
+  const until = Date.now() + 15000
+  while (Date.now() < until) {
+    await new Promise(r => setTimeout(r, 100))
+    const [moved, href, ready] = await quick(page, () => [!window.__claudeInFirefoxLeaving, location.href, document.readyState], [])
+    if ((moved || href !== before) && ready === 'complete') return
+  }
+}
+
+// Not element.click(): it waits on an IntersectionObserver report first.
+async function centre(el) {
+  const p = await el.evaluate(e => {
+    const seen = r => r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth
+    let rects = [...e.getClientRects()]
+    if (!rects.some(seen)) {
+      e.scrollIntoView({ block: 'center', inline: 'center' })
+      rects = [...e.getClientRects()]
+    }
+    const r = rects.find(seen)
+    if (!r) return null
+    return {
+      x: (Math.max(r.left, 0) + Math.min(r.right, innerWidth)) / 2,
+      y: (Math.max(r.top, 0) + Math.min(r.bottom, innerHeight)) / 2,
+    }
+  })
+  if (!p) throw new Error('That element takes no space on the page, so it cannot be clicked. It may be hidden; call read_page again.')
+  return p
+}
+
 async function settle(page) {
   try {
     await page.waitForNetworkIdle({ idleTime: 300, timeout: 3000 })
@@ -179,11 +257,10 @@ async function settle(page) {
 }
 
 // page.url() goes stale when Firefox restores a page from its back/forward cache.
+const live = async page => (await quick(page, () => [location.href, document.title], null, 2000)) ?? [page.url(), '']
+
 const where = async page => {
-  const [url, title] = await Promise.race([
-    page.evaluate(() => [location.href, document.title]).catch(() => null),
-    new Promise(r => setTimeout(r, 2000)),
-  ]).then(live => live ?? [page.url(), ''])
+  const [url, title] = await live(page)
   return `Now at ${url} — "${title}"`
 }
 
@@ -192,8 +269,8 @@ tool('tabs_list', 'List the open Firefox tabs with their ids. Tabs Claude opened
   if (!all.length) return text('No tabs open.')
   const lines = await Promise.all(
     all.map(async ({ id, page }) => {
-      const title = await page.title().catch(() => '')
-      return `[${id}] ${pageState.get(page)?.mine ? '(mine) ' : ''}${title} — ${page.url()}`
+      const [url, title] = await live(page)
+      return `[${id}] ${pageState.get(page)?.mine ? '(mine) ' : ''}${title} — ${url}`
     }),
   )
   return text(lines.join('\n'))
@@ -201,11 +278,13 @@ tool('tabs_list', 'List the open Firefox tabs with their ids. Tabs Claude opened
 
 tool('tab_open', 'Open a new tab, optionally at a URL. Work in a tab you opened unless the user names one of theirs.', { url: z.string().optional() }, async ({ url }) => {
   const b = await getBrowser()
-  const page = await b.newPage()
+  // A foreground tab waits for the window to repaint; see front().
+  const page = await b.newPage({ background: true })
   const id = idOf(page)
   pageState.get(page).mine = true
-  if (url) await page.goto(url, { waitUntil: 'load', timeout: 30000 })
-  return text(`Opened tab ${id}. ${await where(page)}`)
+  front(page)
+  const status = url ? await load(page, url) : ''
+  return text(`Opened tab ${id}. ${status}${await where(page)}`)
 })
 
 tool('tab_close', 'Close a tab.', { tab: tabArg }, async ({ tab: id }) => {
@@ -215,10 +294,10 @@ tool('tab_close', 'Close a tab.', { tab: tabArg }, async ({ tab: id }) => {
   return text(`Closed tab ${id}.`)
 })
 
-tool('tab_focus', 'Bring a tab to the front of its window.', { tab: tabArg }, async ({ tab: id }) => {
+tool('tab_focus', 'Show a tab in front of the others in its window, for the user to see. The other tools work on a tab whether it is in front or not.', { tab: tabArg }, async ({ tab: id }) => {
   const page = await tab(id)
-  await page.bringToFront()
-  return text(`Tab ${id} is in front. ${await where(page)}`)
+  front(page)
+  return text(`Brought tab ${id} forward. If Firefox's window is behind another one, the switch shows when the user looks at it. ${await where(page)}`)
 })
 
 tool(
@@ -227,22 +306,11 @@ tool(
   { tab: tabArg, url: z.string() },
   async ({ tab: id, url }) => {
     const page = await tab(id)
-    const opts = { waitUntil: 'load', timeout: 30000 }
-    // A page restored from the back/forward cache never fires load.
-    const history = { waitUntil: 'load', timeout: 5000 }
-    const quiet = e => {
-      if (e?.name !== 'TimeoutError') throw e
-      return null
+    if (url === 'back' || url === 'forward') {
+      await act(() => traverse(page, url === 'back' ? -1 : 1), 20000)
+      return text(await where(page))
     }
-    const res = await act(
-      () =>
-        url === 'back' ? page.goBack(history).catch(quiet)
-        : url === 'forward' ? page.goForward(history).catch(quiet)
-        : url === 'reload' ? page.reload(opts)
-        : page.goto(url, opts),
-      40000,
-    )
-    return text(`${res ? `HTTP ${res.status()}. ` : ''}${await where(page)}`)
+    return text(`${await load(page, url)}${await where(page)}`)
   },
 )
 
@@ -350,11 +418,11 @@ tool(
 
 tool(
   'screenshot',
-  'A PNG of what the tab shows. Brings the tab to the front first. Coordinates in it are CSS pixels for click x/y.',
+  'A PNG of what the tab shows, whether or not it is in front. Coordinates in it are CSS pixels for click x/y.',
   { tab: tabArg, full_page: z.boolean().optional() },
   async ({ tab: id, full_page = false }) => {
     const page = await tab(id)
-    await page.bringToFront()
+    front(page)
     const data = await page.screenshot({ type: 'png', fullPage: full_page, encoding: 'base64' })
     return { content: [{ type: 'image', data, mimeType: 'image/png' }, { type: 'text', text: await where(page) }] }
   },
@@ -362,7 +430,7 @@ tool(
 
 tool(
   'click',
-  'Click an element (ref or selector) or a point (x, y in CSS pixels). Brings the tab to the front. A confirm or prompt dialog the click opens is dismissed unless accept_dialog is true; alerts are accepted.',
+  'Click an element (ref or selector) or a point (x, y in CSS pixels). A confirm or prompt dialog the click opens is dismissed unless accept_dialog is true; alerts are accepted.',
   {
     tab: tabArg,
     ...target,
@@ -374,14 +442,17 @@ tool(
   },
   async ({ tab: id, ref, selector, x, y, button = 'left', double = false, accept_dialog = false }) => {
     const page = await tab(id)
-    await page.bringToFront()
+    front(page)
     const s = instrument(page)
     const opts = { button, count: double ? 2 : 1 }
     if (accept_dialog) s.acceptDialogs++
     try {
       const el = await element(page, { ref, selector })
       if (!el && (x === undefined || y === undefined)) throw new Error('Give a ref, a selector, or x and y.')
-      await act(() => (el ? el.click(opts) : page.mouse.click(x, y, opts)))
+      await act(async () => {
+        const p = el ? await centre(el) : { x, y }
+        await page.mouse.click(p.x, p.y, opts)
+      })
       await settle(page)
     } finally {
       if (accept_dialog) setTimeout(() => s.acceptDialogs--, 1000)
@@ -396,10 +467,19 @@ tool(
   { tab: tabArg, text: z.string(), ...target, clear: z.boolean().optional(), submit: z.boolean().optional() },
   async ({ tab: id, text: t, ref, selector, clear = false, submit = false }) => {
     const page = await tab(id)
-    await page.bringToFront()
+    front(page)
     const el = await element(page, { ref, selector })
     await act(async () => {
-      if (el) await el.click()
+      if (el) {
+        const p = await centre(el)
+        await page.mouse.click(p.x, p.y)
+        // The click leaves the caret where it landed; typing adds to the end.
+        await el.evaluate(e => {
+          try {
+            e.setSelectionRange?.(e.value.length, e.value.length)
+          } catch {}
+        })
+      }
       if (clear) {
         await page.keyboard.down('Control')
         await page.keyboard.press('a')
@@ -420,7 +500,7 @@ tool(
   { tab: tabArg, keys: z.string() },
   async ({ tab: id, keys }) => {
     const page = await tab(id)
-    await page.bringToFront()
+    front(page)
     await act(async () => {
       for (const combo of keys.split(/\s+/).filter(Boolean)) {
         const parts = combo.split('+')
@@ -477,8 +557,16 @@ tool(
   { tab: tabArg, text: z.string().optional(), selector: z.string().optional(), timeout_ms: z.number().int().optional().describe('Default 10000') },
   async ({ tab: id, text: t, selector, timeout_ms = 10000 }) => {
     const page = await tab(id)
-    if (selector) await page.waitForSelector(selector, { visible: true, timeout: timeout_ms })
-    else if (t) await page.waitForFunction(want => document.body?.innerText.includes(want), { timeout: timeout_ms }, t)
+    // Polled on a timer: waitForSelector's visible check runs per animation frame.
+    const opts = { timeout: timeout_ms, polling: 250 }
+    if (selector) {
+      await page.waitForFunction(sel => {
+        const e = document.querySelector(sel)
+        if (!e) return false
+        const r = e.getBoundingClientRect()
+        return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'
+      }, opts, selector)
+    } else if (t) await page.waitForFunction(want => document.body?.innerText.includes(want), opts, t)
     else throw new Error('Give text or a selector.')
     return text(`Found. ${await where(page)}`)
   },
