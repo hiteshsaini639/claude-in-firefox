@@ -40,8 +40,10 @@ profile (sign-ins, history, settings) at
 `~/snap/firefox/common/claude-profile` for the snap Firefox, or
 `~/.local/share/claude-in-firefox/profile` otherwise. The first time it is
 empty: sign in there only to the sites you want Claude to use. It keeps those
-sign-ins between runs. Quit it (Ctrl+Q in its window) when Claude is done;
-your everyday Firefox is not touched.
+sign-ins between runs. When Claude is done it closes its tabs and, if it
+started this Firefox, quits it; it asks first about any tab it did not open.
+You can also quit it yourself (Ctrl+Q in its window). Your everyday Firefox
+is not touched.
 
 Why this is the safer way: while remote control is on, any program on this
 machine can drive that Firefox, with no password, and Claude can be misled by
@@ -85,6 +87,9 @@ Quit Firefox and start it normally to switch it off. It needs, once:
   the tools work on a tab whether it is in front or not. Firefox does not
   repaint a window that is out of sight, though, so animations on its pages
   pause until you look at it.
+- Firefox does not let remote control close its last tab. Claude can quit
+  its own profile's Firefox instead (`quit_firefox`), never your everyday
+  one: the server checks which profile is running and refuses.
 - `read_page` does not see inside iframes; Claude uses a screenshot and
   clicks by position there.
 - Console and network output is kept from the moment the server first
@@ -94,7 +99,8 @@ Quit Firefox and start it normally to switch it off. It needs, once:
 
 `tabs_list`, `tab_open`, `tab_close`, `tab_focus`, `navigate`, `read_page`,
 `get_text`, `screenshot`, `click`, `type`, `press_key`, `select_option`,
-`scroll`, `wait_for`, `run_js`, `console_messages`, `network_requests`.
+`scroll`, `wait_for`, `run_js`, `console_messages`, `network_requests`,
+`quit_firefox`.
 
 `FIREFOX_REMOTE_PORT` changes the port, for the script and the server alike.
 `FIREFOX_PROFILE` points the script at a profile folder other than your
@@ -104,3 +110,7 @@ default.
 
 With `bin/firefox-remote --claude-profile` running, `pnpm test` puts every
 tool through the server against a local test page, in tabs of its own.
+
+With Claude's Firefox closed, `pnpm test:quit` checks `quit_firefox` and the
+last tab: it starts Claude's profile headless and quits it, and starts a
+throwaway profile in place of yours that it must refuse to quit.

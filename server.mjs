@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 // MCP server that drives a Firefox started by bin/firefox-remote, over
 // Firefox's built-in WebDriver BiDi remote control.
+import { execFile } from 'node:child_process'
+import { existsSync, readFileSync, realpathSync } from 'node:fs'
+import { promisify } from 'node:util'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import puppeteer from 'puppeteer-core'
@@ -10,6 +13,13 @@ const PORT = Number(process.env.FIREFOX_REMOTE_PORT ?? 9222)
 const ENDPOINT = `ws://127.0.0.1:${PORT}/session`
 const START = new URL('./bin/firefox-remote', import.meta.url).pathname
 const BUFFER = 500
+const HOME = process.env.HOME
+// Where bin/firefox-remote --claude-profile keeps Claude's profile.
+const CLAUDE_PROFILE = existsSync('/snap/bin/firefox')
+  ? `${HOME}/snap/firefox/common/claude-profile`
+  : `${process.env.XDG_DATA_HOME || `${HOME}/.local/share`}/claude-in-firefox/profile`
+const BLANK = /^about:(blank|newtab|home|privatebrowsing)$/
+const run = promisify(execFile)
 
 let browser = null
 let connecting = null
@@ -287,12 +297,61 @@ tool('tab_open', 'Open a new tab, optionally at a URL. Work in a tab you opened 
   return text(`Opened tab ${id}. ${status}${await where(page)}`)
 })
 
-tool('tab_close', 'Close a tab.', { tab: tabArg }, async ({ tab: id }) => {
+tool('tab_close', 'Close a tab. Firefox keeps its last tab open; in Claude\'s own profile, quit_firefox closes that one.', { tab: tabArg }, async ({ tab: id }) => {
   const page = await tab(id)
+  // Remote control cannot close Firefox's last tab: the command is ignored.
+  if ((await (await getBrowser()).pages()).length === 1) {
+    throw new Error(`Tab ${id} is Firefox's last tab, which remote control cannot close. In Claude's own profile, quit_firefox closes it and Firefox; otherwise leave it.`)
+  }
   await page.close()
   tabs.delete(id)
   return text(`Closed tab ${id}.`)
 })
+
+const listening = async () => (await run('ss', ['-ltnH', `sport = :${PORT}`]).catch(() => ({ stdout: '' }))).stdout.trim() !== ''
+
+// The profile folder of the Firefox on PORT, from its command line.
+async function listeningProfile() {
+  try {
+    const { stdout } = await run('ss', ['-ltnpH', `sport = :${PORT}`])
+    const pid = stdout.match(/pid=(\d+)/)?.[1]
+    const args = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')
+    const i = args.findIndex(a => a === '--profile' || a === '-profile')
+    return i < 0 ? null : realpathSync(args[i + 1])
+  } catch {
+    return null
+  }
+}
+
+tool(
+  'quit_firefox',
+  "Quit Claude's own Firefox (the one bin/firefox-remote --claude-profile starts), with all its tabs. Refuses the user's everyday Firefox. Refuses while tabs Claude did not open are open, unless the user agreed to close them (others_agreed). Pages close without their unsaved-changes prompts.",
+  { others_agreed: z.boolean().optional().describe('The user said yes to closing the tabs Claude did not open') },
+  async ({ others_agreed = false }) => {
+    if (!(await listening())) return text('Firefox is not running.')
+    const b = await getBrowser()
+    const profile = await listeningProfile()
+    let claude = CLAUDE_PROFILE
+    try {
+      claude = realpathSync(CLAUDE_PROFILE)
+    } catch {}
+    if (!profile) throw new Error("Could not tell which profile this Firefox runs, so it stays open. Ask the user to quit it (Ctrl+Q in its window).")
+    if (profile !== claude) throw new Error(`This Firefox runs ${profile}, not Claude's own profile. Never quit it: the user does, when they choose.`)
+    const others = []
+    for (const { id, page } of await listTabs()) {
+      const [url, title] = await live(page)
+      if (!pageState.get(page)?.mine && !BLANK.test(url)) others.push(`[${id}] ${title} — ${url}`)
+    }
+    if (others.length && !others_agreed) {
+      throw new Error(`These tabs were not opened by Claude in this session:\n${others.join('\n')}\nAsk the user whether to close them, and pass others_agreed: true only if they say yes.`)
+    }
+    await b.close()
+    for (const until = Date.now() + 10000; Date.now() < until; await new Promise(r => setTimeout(r, 200))) {
+      if (!(await listening())) return text('Firefox has quit.')
+    }
+    return text('Firefox closed its tabs but is still running. Ask the user to quit it (Ctrl+Q in its window).')
+  },
+)
 
 tool('tab_focus', 'Show a tab in front of the others in its window, for the user to see. The other tools work on a tab whether it is in front or not.', { tab: tabArg }, async ({ tab: id }) => {
   const page = await tab(id)

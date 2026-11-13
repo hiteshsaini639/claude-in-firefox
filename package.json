@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node server.mjs",
     "test": "node test/e2e.mjs",
-    "check": "node --check server.mjs && node --check test/e2e.mjs && bash -n bin/firefox-remote"
+    "test:quit": "node test/quit.mjs",
+    "check": "node --check server.mjs && node --check test/e2e.mjs && node --check test/quit.mjs && bash -n bin/firefox-remote"
   },
   "engines": {
     "node": ">=20"

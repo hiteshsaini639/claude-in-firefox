@@ -29,8 +29,7 @@ allows one at a time.
 
 ## Working
 
-- Open your own tab with `tab_open` unless the user names one of theirs. When
-  done, close the tabs you opened unless the user wants to see them.
+- Open your own tab with `tab_open` unless the user names one of theirs.
 - The tools work on a tab whether or not it is in front, and while Firefox's
   window is behind others; never ask the user to bring it forward for them.
   `tab_focus` is only for showing the user a tab.
@@ -46,6 +45,17 @@ allows one at a time.
   click by `x`, `y`; screenshot pixels are the coordinates `click` takes.
 - `console_messages` and `network_requests` hold only what happened after the
   server first touched the tab. Reload to capture a page's loading output.
+
+## Finishing
+
+- Close the tabs you opened, unless the user wants to see them.
+- If you started Claude's profile in this conversation, quit it with
+  `quit_firefox` once the task is done. It refuses while tabs you did not
+  open are there (ones the user opened, or ones you opened for the user to
+  use): ask the user whether to close them, and pass `others_agreed: true`
+  only on their yes. If they want to keep using it, leave it running.
+- Firefox keeps its last tab open; `tab_close` says so rather than closing
+  it. Never quit the user's everyday Firefox; `quit_firefox` refuses it.
 
 ## Care
 
